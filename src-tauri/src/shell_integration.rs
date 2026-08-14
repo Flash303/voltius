@@ -329,24 +329,6 @@ EOF
     exec tmux -L {socket} -f "$TMUX_CONF" new-session -A -s {key} "$V" <&2
   fi
   exec tmux -L {socket} new-session -A -s {key} "$V" <&2
-elif command -v screen >/dev/null 2>&1; then
-  screen -wipe >/dev/null 2>&1
-  for d in $(screen -ls 2>/dev/null | grep -F .{key} | awk '{{print $1}}' | tail -n +2); do
-    screen -S "$d" -X quit >/dev/null 2>&1
-  done
-  SCREEN_RC=$(mktemp 2>/dev/null)
-  if [ -n "$SCREEN_RC" ]; then
-    cat > "$SCREEN_RC" <<'EOF'
-startup_message off
-msgwait 0
-msgminwait 0
-vbell off
-defscrollback 50000
-termcapinfo xterm* ti@:te@
-EOF
-    exec screen -c "$SCREEN_RC" -S {key} -D -R sh -c "$V" <&2
-  fi
-  exec screen -S {key} -D -R sh -c "$V" <&2
 else
   printf '\r\n[voltius] tmux/screen not found - session will not survive disconnects\r\n'
   exec sh -c "$V" <&2
@@ -367,8 +349,6 @@ pub fn persistent_attach_command(session_key: &str) -> String {
     let script = format!(
         r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
   exec tmux -L {socket} attach-session -t {key} <&2
-elif command -v screen >/dev/null 2>&1; then
-  exec screen -x -S {key} <&2
 fi
 printf '\r\n[voltius] session has ended\r\n'
 exit 97
@@ -386,9 +366,6 @@ pub fn persistent_probe_command(session_key: &str) -> String {
     let script = format!(
         r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
   printf VOLTIUS_PRESENT
-elif command -v screen >/dev/null 2>&1; then
-  screen -wipe >/dev/null 2>&1
-  screen -ls 2>/dev/null | grep -qF .{key} && printf VOLTIUS_PRESENT
 fi
 true"#,
         socket = TMUX_SOCKET,
@@ -419,15 +396,6 @@ pub fn capture_history_command(session_key: &str, pty_rows: u32) -> String {
     format!(
         r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
   tmux -L {socket} capture-pane -t {key} -peJ -S -50000 -E -1 2>/dev/null
-elif command -v screen >/dev/null 2>&1; then
-  f=$(mktemp 2>/dev/null) || exit 0
-  screen -S {key} -X hardcopy -h "$f" 2>/dev/null
-  for i in $(seq 1 15); do
-    a=$(wc -c <"$f" 2>/dev/null); sleep 0.1; b=$(wc -c <"$f" 2>/dev/null)
-    [ "$a" = "$b" ] && break
-  done
-  head -n -{rows} "$f" 2>/dev/null
-  rm -f "$f"
 fi
 true"#,
         socket = TMUX_SOCKET,
@@ -448,25 +416,6 @@ pub fn cwd_probe_command(session_key: &str) -> String {
     let script = format!(
         r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
   tmux -L {socket} display-message -p -t {key} '#{{pane_current_path}}'
-elif command -v screen >/dev/null 2>&1; then
-  spid=$(screen -ls 2>/dev/null | grep -F .{key} | head -n1 | awk '{{print $1}}' | cut -d. -f1)
-  if [ -n "$spid" ]; then
-    pid=$spid
-    cwd=""
-    # Descend the tree to the foreground process. The window's wrapper sh pipes
-    # into the real shell, so the interactive shell is a grandchild — the direct
-    # child keeps a stale login cwd. Track the last process with a readable cwd
-    # so transient/dead leaves and cwd-less wrappers are skipped.
-    while :; do
-      c=$(pgrep -P "$pid" 2>/dev/null | tail -n1)
-      [ -n "$c" ] || c=$(ps -o pid= --ppid "$pid" 2>/dev/null | tail -n1 | tr -d ' ')
-      [ -n "$c" ] || break
-      pid=$c
-      cur=$(readlink /proc/$pid/cwd 2>/dev/null)
-      [ -n "$cur" ] && cwd=$cur
-    done
-    [ -n "$cwd" ] && printf '%s\n' "$cwd"
-  fi
 fi
 true"#,
         socket = TMUX_SOCKET,
@@ -490,8 +439,6 @@ if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/d
   if [ "$(tmux -L {socket} list-clients -t {key} 2>/dev/null | grep -c .)" -le {max} ]; then
     tmux -L {socket} kill-session -t {key} 2>/dev/null && K=1
   fi
-elif command -v screen >/dev/null 2>&1 && screen -ls 2>/dev/null | grep -qF .{key}; then
-  screen -S {key} -X quit >/dev/null 2>&1 && K=1
 else
   K=1
 fi
@@ -644,17 +591,6 @@ mod tests {
         assert!(script.contains("new-session -A -s voltius_s1"));
         // Shared sessions: creating must never detach another device's client.
         assert!(!script.contains(" -D -s"));
-        assert!(script.contains("command -v screen"));
-        assert!(script.contains("screen -S voltius_s1"));
-        assert!(script.contains("screen -c"));
-        // Self-heal: wipe dead entries and collapse same-named duplicates so
-        // -D -R can't fail into the "several suitable screens" reconnect loop.
-        assert!(script.contains("screen -wipe"));
-        assert!(script.contains("grep -F .voltius_s1"));
-        assert!(script.contains("-X quit"));
-        assert!(script.contains("msgwait 0"));
-        assert!(script.contains("ti@:te@"));
-        assert!(script.contains("will not survive disconnects"));
         assert!(!inner.contains('"'));
         assert!(script.contains(&inner));
     }
@@ -688,18 +624,14 @@ mod tests {
         // Co-attach: never detach the other device, never create a session.
         assert!(!script.contains("new-session"));
         assert!(!script.contains("-D"));
-        assert!(script.contains("screen -x -S voltius_s1"));
         // Re-attach over the stderr pty (`<&2`); modern tmux rejects `</dev/tty`.
         assert!(script.contains("<&2"));
     }
 
     #[test]
-    fn persistent_probe_detects_both_multiplexers() {
+    fn persistent_probe_detects_multiplexers() {
         let script = decode_bootstrap(&persistent_probe_command("voltius_s1"));
         assert!(script.contains("tmux -L voltius has-session -t voltius_s1"));
-        // Dead screen entries must not read as present (attach -x would fail).
-        assert!(script.contains("screen -wipe"));
-        assert!(script.contains("grep -qF .voltius_s1"));
         assert!(script.contains("VOLTIUS_PRESENT"));
         assert!(script.trim_end().ends_with("true"));
     }
@@ -726,7 +658,6 @@ mod tests {
         // Unconditional: the client-count guard uses the force threshold.
         assert!(decoded.contains("-le 1000000"));
         assert!(decoded.contains("tmux -L voltius kill-session -t voltius_s1"));
-        assert!(decoded.contains("screen -S voltius_s1 -X quit"));
         assert!(decoded.contains("VOLTIUS_KILLED"));
     }
 
@@ -817,35 +748,14 @@ mod tests {
     }
 
     #[test]
-    fn cwd_probe_queries_tmux_and_descends_screen_proc() {
+    fn cwd_probe_queries_tmux() {
         let script = decode_bootstrap(&cwd_probe_command("voltius_s1"));
         // tmux: query pane_current_path on our private socket/session.
         assert!(script.contains("tmux -L voltius has-session -t voltius_s1"));
         assert!(script.contains("display-message -p -t voltius_s1 '#{pane_current_path}'"));
-        // screen has no cwd query: find the server pid, descend the process
-        // tree, and read /proc/<pid>/cwd.
-        assert!(script.contains("screen -ls"));
-        assert!(script.contains("grep -F .voltius_s1"));
-        assert!(script.contains("pgrep -P"));
-        assert!(script.contains("ps -o pid= --ppid"));
-        assert!(script.contains("readlink /proc/$pid/cwd"));
-        // Track the last readable cwd so wrapper shells (stale login cwd) and
-        // transient/dead leaves don't win over the real interactive shell.
-        assert!(script.contains("[ -n \"$cur\" ] && cwd=$cur"));
         // Never errors the channel; ends clean for the caller's read loop.
         assert!(script.contains("2>/dev/null"));
         assert!(script.trim_end().ends_with("true"));
-    }
-
-    #[test]
-    fn capture_history_falls_back_to_screen_hardcopy() {
-        let cmd = capture_history_command("voltius_s1", 40);
-        // screen has no stdout dump; hardcopy -h writes scrollback to a temp file.
-        assert!(cmd.contains("screen -S voltius_s1 -X hardcopy -h"));
-        // Trim the live viewport (pty_rows) so the attach redraw isn't duplicated.
-        assert!(cmd.contains("head -n -40"));
-        // Gated behind screen availability, after the tmux branch.
-        assert!(cmd.contains("elif command -v screen >/dev/null 2>&1; then"));
     }
 
     #[test]
